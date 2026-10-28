@@ -4,7 +4,7 @@
 #   $DIST/gridcraft-<version>-macos-<arch>.dmg          GridCraft.app on a drag-to-Applications DMG
 #   $DIST/gridcraft-cli-<version>-macos-<arch>.zip      the headless CLI
 #
-# Usage: packaging/macos/package.sh [--arch universal|aarch64|x86_64] [--skip-build]
+# Usage: packaging/macos/package.sh [--arch universal|aarch64|x86_64] [--skip-build] [--app-only]
 #
 # Signing (env):
 #   MACOS_SIGN_IDENTITY   codesign identity (name or SHA-1). Default "-" = ad-hoc (local testing;
@@ -19,10 +19,12 @@ HERE="$ROOT/packaging/macos"
 
 ARCH=universal
 SKIP_BUILD=0
+APP_ONLY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --arch) ARCH="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
+    --app-only) APP_ONLY=1; shift ;;
     -h | --help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -58,12 +60,16 @@ echo "==> GridCraft $VERSION for macOS ($ARCH), identity: $IDENTITY, notarize: $
 if [[ "$SKIP_BUILD" = 0 ]]; then
   args=()
   for t in "${TARGETS[@]}"; do args+=(--target "$t"); done
-  (cd "$ROOT" && cargo build --release --locked -p gridcraft -p gridcraft-cli "${args[@]}")
+  packages=(-p gridcraft)
+  [[ "$APP_ONLY" = 1 ]] || packages+=(-p gridcraft-cli)
+  (cd "$ROOT" && cargo build --release --locked "${packages[@]}" "${args[@]}")
 fi
 
 rm -rf "$WORK"
 mkdir -p "$WORK/bin"
-for bin in gridcraft gridcraft-cli; do
+binaries=(gridcraft)
+[[ "$APP_ONLY" = 1 ]] || binaries+=(gridcraft-cli)
+for bin in "${binaries[@]}"; do
   inputs=()
   for t in "${TARGETS[@]}"; do inputs+=("$CARGO_TARGET_DIR/$t/release/$bin"); done
   lipo -create -output "$WORK/bin/$bin" "${inputs[@]}"
@@ -116,7 +122,16 @@ echo "==> assembling $APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # Executable and icon carry the display name (CFBundleExecutable / CFBundleIconFile).
 cp "$WORK/bin/gridcraft" "$APP/Contents/MacOS/GridCraft"
-cp "$ROOT/assets/app-icon/gridcraft.icns" "$APP/Contents/Resources/GridCraft.icns"
+# Original cobalt/violet community icon; built deterministically from Swift.
+swift "$HERE/custom-icon.swift" "$WORK/custom-icon-1024.png"
+ICON_DIR="$WORK/custom-icon.iconset"
+mkdir -p "$ICON_DIR"
+for edge in 16 32 128 256 512; do
+  sips -s format png -z "$edge" "$edge" "$WORK/custom-icon-1024.png" --out "$ICON_DIR/icon_${edge}x${edge}.png" >/dev/null
+  double=$((edge * 2))
+  sips -s format png -z "$double" "$double" "$WORK/custom-icon-1024.png" --out "$ICON_DIR/icon_${edge}x${edge}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICON_DIR" -o "$APP/Contents/Resources/GridCraft.icns"
 # Bundled dependency font notices are installed before the app is signed.
 cp "$ROOT/NOTICE" "$ROOT/ATTRIBUTION.md" "$APP/Contents/Resources/"
 # Licences of the embedded craft-fonts fonts (only when built with CRAFT_FONTS_DIR).
@@ -151,20 +166,43 @@ ln -s /Applications "$STAGE/Applications"
 mkdir -p "$STAGE/.background"
 cp "$HERE/dmg/background.tiff" "$STAGE/.background/background.tiff"
 cp "$HERE/dmg/dmg-layout.DS_Store" "$STAGE/.DS_Store"
-rm -f "$DMG" "$WORK/raw.dmg"
-# makehybrid + convert builds the image without attaching a device, unlike `create -srcfolder`,
-# which is flaky on CI runners ("Resource busy") and hangs in sandboxed sessions.
-# The volume name has no version: .DS_Store finds the background through an alias that includes it.
-hdiutil makehybrid -hfs -hfs-volume-name "GridCraft" -hfs-openfolder "$STAGE" -o "$WORK/raw.dmg" "$STAGE"
-hdiutil convert "$WORK/raw.dmg" -format UDZO -imagekey zlib-level=9 -o "$DMG"
-rm -f "$WORK/raw.dmg"
+rm -f "$DMG"
+# hdiutil create avoids FinderInfo detritus introduced by makehybrid.
+# Retry a limited number of times if the CI runner reports a busy device.
+hdiutil_retry() {
+  local operation="$1" attempt
+  shift
+  for attempt in 1 2 3 4 5; do
+    if hdiutil "$@"; then return 0; fi
+    [[ "$attempt" = 5 ]] && { echo "hdiutil $operation failed 5 times" >&2; return 1; }
+    warn "hdiutil $operation attempt $attempt failed; retrying"
+    sleep $((attempt * 10))
+  done
+}
+hdiutil_retry create create -srcfolder "$STAGE" -volname "GridCraft" -fs HFS+ -format UDZO -imagekey zlib-level=9 -ov "$DMG"
 sign "$DMG"
 codesign --verify --strict --verbose=2 "$DMG"
+# Verify the bundled app inside the mounted DMG.
+MOUNT="$WORK/dmg-check"
+mkdir -p "$MOUNT"
+hdiutil_retry attach attach -readonly -nobrowse -noautoopen -mountpoint "$MOUNT" "$DMG" >/dev/null
+if ! codesign --verify --strict --deep --verbose=2 "$MOUNT/GridCraft.app"; then
+  hdiutil_retry detach detach "$MOUNT" >/dev/null || true
+  exit 1
+fi
+hdiutil_retry detach detach "$MOUNT" >/dev/null
 if [[ "$NOTARIZE" = 1 ]]; then
   notarize "$DMG"
   stapler_retry staple "$DMG"
   stapler_retry validate "$DMG"
   spctl --assess --type open --context context:primary-signature -vvv "$DMG"
+fi
+
+# Lean community installer only contains the GUI; no CLI or developer documentation.
+if [[ "$APP_ONLY" = 1 ]]; then
+  echo "==> lean Apple Silicon GridCraft DMG ready"
+  ls -lh "$DMG"
+  exit 0
 fi
 
 # ---- CLI ---------------------------------------------------------------------------------------

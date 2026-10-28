@@ -1,0 +1,62 @@
+name: Apple Silicon Community App (Lean)
+
+on:
+  push:
+    branches: [custom/apple-silicon-community]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gridcraft-lean-apple-silicon-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build lean GridCraft ARM64 DMG
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      MACOS_SIGN_IDENTITY: "-"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Check out custom GridCraft edition
+        uses: actions/checkout@v4
+      - name: Install ARM64 Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Reuse Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: gridcraft-lean-apple-silicon
+      - name: Validate packaging and remove promotional links
+        run: |
+          set -euo pipefail
+          bash -n packaging/macos/package.sh
+          swiftc -parse packaging/macos/custom-icon.swift
+          ! grep -E 'getartcraft[.]com/apps/gridcraft|discord[.]gg/artcraft' crates/ui-egui/src/dialogs/about.rs apps/gridcraft/src/native_menu.rs
+      - name: Verify GridCraft GUI for Apple Silicon
+        run: cargo check --locked --target aarch64-apple-darwin -p gridcraft
+      - name: Build native lean app DMG
+        run: bash packaging/macos/package.sh --arch aarch64 --app-only
+      - name: Verify ARM64 app, branding and signature
+        run: |
+          set -euo pipefail
+          app=target/macos-package/GridCraft.app
+          test -d "$app"
+          test -f "$app/Contents/MacOS/GridCraft"
+          test -f "$app/Contents/Resources/GridCraft.icns"
+          lipo -archs "$app/Contents/MacOS/GridCraft" | grep -w arm64
+          test "$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist")" = "com.boneyjoseph.gridcraft"
+          test "$(plutil -extract CFBundleDisplayName raw -o - "$app/Contents/Info.plist")" = "GridCraft"
+          codesign --verify --strict --deep "$app"
+          ls -lh dist/release/*macos-aarch64.dmg
+      - name: Upload lean Apple Silicon DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: GridCraft-Apple-Silicon-Lean-DMG
+          path: dist/release/*macos-aarch64.dmg
+          if-no-files-found: error
+          retention-days: 30
